@@ -1,0 +1,26 @@
+Full Project Explanation
+Hardware-Aware Dynamic Scheduling for Multicore Linux Systems
+
+Developed a hardware-aware adaptive scheduling framework for multicore Linux systems focused on reducing shared hardware resource contention and improving execution predictability in embedded multicore environments. The framework dynamically profiles runtime workload behavior using Linux hardware performance counters through perf_event_open() to monitor Instructions Per Cycle (IPC), cache miss rates, and processor utilization in real time.
+
+Implemented a lightweight userspace scheduling daemon on a Raspberry Pi 3 multicore platform capable of dynamic process discovery, runtime workload classification, adaptive CPU affinity management using sched_setaffinity(), load-aware balancing, and stability-aware task migration without requiring Linux kernel modifications. Workloads were classified as compute-intensive, memory-intensive, or mixed based on runtime hardware behavior, enabling intelligent workload-aware core placement and reduced cache contention.
+
+Designed adaptive runtime reprofiling and migration mechanisms to continuously monitor workload phase transitions and dynamically migrate tasks across processor cores when execution behavior changed during runtime. Integrated migration hysteresis and workload stability counters to prevent excessive scheduling oscillation while maintaining responsiveness to dynamic workload conditions.
+
+Built a synthetic workload benchmarking framework consisting of compute-intensive, memory-intensive, mixed, and dynamically shifting workloads to evaluate scheduler behavior under controlled multicore resource contention scenarios. Experimental evaluation demonstrated accurate workload classification, adaptive migration behavior, improved workload isolation, reduced cache miss rates, balanced multicore utilization, and approximately 52% higher system instruction throughput compared to the default Linux Completely Fair Scheduler (CFS).
+
+Technologies Used
+C/C++
+Linux
+Raspberry Pi 3
+Ubuntu Linux
+perf_event_open()
+sched_setaffinity()
+Hardware Performance Counters
+Multicore Scheduling
+Embedded Systems
+Operating Systems
+Performance Engineering
+CPU Affinity Management
+Runtime Profiling
+Linux Systems Programming
