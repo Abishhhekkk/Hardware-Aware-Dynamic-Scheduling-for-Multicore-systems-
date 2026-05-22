@@ -1,26 +1,90 @@
-Full Project Explanation
-Hardware-Aware Dynamic Scheduling for Multicore Linux Systems
+# Hardware-Aware Dynamic Scheduling for Multicore Linux Systems
 
-Developed a hardware-aware adaptive scheduling framework for multicore Linux systems focused on reducing shared hardware resource contention and improving execution predictability in embedded multicore environments. The framework dynamically profiles runtime workload behavior using Linux hardware performance counters through perf_event_open() to monitor Instructions Per Cycle (IPC), cache miss rates, and processor utilization in real time.
+## Overview
+Developed a **hardware-aware adaptive scheduling framework** for multicore Linux systems focused on reducing shared hardware resource contention and improving execution predictability in embedded multicore environments. The framework dynamically profiles runtime workload behavior using Linux hardware performance counters through `perf_event_open()` to monitor **Instructions Per Cycle (IPC)**, cache miss rates, and processor utilization in real time.
 
-Implemented a lightweight userspace scheduling daemon on a Raspberry Pi 3 multicore platform capable of dynamic process discovery, runtime workload classification, adaptive CPU affinity management using sched_setaffinity(), load-aware balancing, and stability-aware task migration without requiring Linux kernel modifications. Workloads were classified as compute-intensive, memory-intensive, or mixed based on runtime hardware behavior, enabling intelligent workload-aware core placement and reduced cache contention.
+---
 
-Designed adaptive runtime reprofiling and migration mechanisms to continuously monitor workload phase transitions and dynamically migrate tasks across processor cores when execution behavior changed during runtime. Integrated migration hysteresis and workload stability counters to prevent excessive scheduling oscillation while maintaining responsiveness to dynamic workload conditions.
+## Core Features
 
-Built a synthetic workload benchmarking framework consisting of compute-intensive, memory-intensive, mixed, and dynamically shifting workloads to evaluate scheduler behavior under controlled multicore resource contention scenarios. Experimental evaluation demonstrated accurate workload classification, adaptive migration behavior, improved workload isolation, reduced cache miss rates, balanced multicore utilization, and approximately 52% higher system instruction throughput compared to the default Linux Completely Fair Scheduler (CFS).
+- **Runtime IPC and Cache Miss Profiling**
+  - Dynamically monitored workload execution behavior using Linux hardware performance counters.
 
-Technologies Used
-C/C++
-Linux
-Raspberry Pi 3
-Ubuntu Linux
-perf_event_open()
-sched_setaffinity()
-Hardware Performance Counters
-Multicore Scheduling
-Embedded Systems
-Operating Systems
-Performance Engineering
-CPU Affinity Management
-Runtime Profiling
-Linux Systems Programming
+- **Hardware-Aware Workload Classification**
+  - Classified workloads as:
+    - Compute-Intensive
+    - Memory-Intensive
+    - Mixed/Dynamic
+
+- **Adaptive CPU Affinity Management**
+  - Implemented intelligent core placement using `sched_setaffinity()`.
+
+- **Dynamic Runtime Task Migration**
+  - Migrated workloads across CPU cores based on runtime behavioral changes.
+
+- **Load-Aware Scheduling**
+  - Continuously balanced multicore utilization to reduce bottlenecks.
+
+- **Migration Hysteresis Stabilization**
+  - Prevented excessive scheduling oscillation using workload stability counters.
+
+- **Userspace Linux Scheduling Framework**
+  - Implemented entirely in userspace without requiring Linux kernel modifications.
+
+---
+
+## System Implementation
+
+Implemented a lightweight userspace scheduling daemon on a **Raspberry Pi 3 multicore platform** capable of:
+
+- Dynamic process discovery
+- Runtime workload profiling
+- CPU utilization monitoring
+- Adaptive workload classification
+- Load-aware balancing
+- Stability-aware migration control
+- Runtime reprofiling
+
+The scheduler continuously analyzed runtime hardware behavior and dynamically optimized workload placement to reduce cache contention and improve execution locality.
+
+---
+
+## Experimental Evaluation
+
+Built a synthetic workload benchmarking framework consisting of:
+
+- Compute-intensive workloads
+- Memory-intensive workloads
+- Mixed workloads
+- Dynamically shifting workloads
+
+Experimental evaluation demonstrated:
+
+- Accurate runtime workload classification
+- Reduced cache contention
+- Improved workload isolation
+- Adaptive runtime migration
+- Balanced multicore utilization
+- Stable scheduling behavior
+- ~52% higher system instruction throughput compared to Linux CFS
+
+---
+
+## Technologies Used
+
+- **C/C++**
+- **Linux**
+- **Ubuntu Linux**
+- **Raspberry Pi 3**
+- `perf_event_open()`
+- `sched_setaffinity()`
+- **Hardware Performance Counters**
+- **Linux Systems Programming**
+- **Embedded Systems**
+- **Operating Systems**
+- **Performance Engineering**
+- **CPU Affinity Management**
+- **Runtime Profiling**
+- **Multicore Scheduling**
+
+---
