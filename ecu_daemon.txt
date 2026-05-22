@@ -1,0 +1,471 @@
+/*
+ * ecu_daemon.cpp — ECU Task Placement Daemon
+ *
+ * Runs forever in the background as a userspace OS layer.
+ * Automatically discovers, profiles, places, and re-profiles tasks.
+ *
+ * What it does:
+ *   1. Every SCAN_INTERVAL seconds  → scans /proc for new PIDs
+ *   2. New PID found                → profiles it (3s perf sample)
+ *   3. Classifies: COMPUTE / MEMORY / MIXED
+ *   4. Picks best core (load-aware) → pins with sched_setaffinity
+ *   5. Every REPROF_INTERVAL seconds → re-profiles known PIDs
+ *   6. If classification changed     → migrates to new core automatically
+ *   7. If PID died                   → removes from tracking table
+ *
+ * All decisions are logged to stdout with timestamps.
+ *
+ * Run:
+ *   sudo ./ecu_daemon            (watches all PIDs)
+ *   sudo ./ecu_daemon 1234 5678  (watches only specific PIDs)
+ *
+ * Stop:
+ *   Ctrl+C  or  kill <daemon_pid>
+ */
+
+#include <cstdint>
+#include <cstring>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <vector>
+#include <string>
+#include <map>
+#include <set>
+
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <dirent.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <linux/perf_event.h>
+#include <sched.h>
+
+// ─── Daemon tuning ────────────────────────────────────────────────────────────
+static constexpr int    SCAN_INTERVAL    =  5;   // seconds between /proc scans
+static constexpr int    REPROF_INTERVAL  = 10;   // seconds between re-profiles
+static constexpr int    SAMPLE_SECS      =  2;   // perf sampling window
+static constexpr double LOAD_BIAS        = 20.0; // % load diff to trigger override
+static constexpr int    MIGRATE_COOLDOWN =  3;   // re-profiles before allowing migration
+
+// ─── Classification thresholds ────────────────────────────────────────────────
+static constexpr double IPC_COMPUTE_MIN  = 0.20;
+static constexpr double IPC_MEMORY_MAX   = 0.10;
+static constexpr double MISS_COMPUTE_MAX = 0.005;
+static constexpr double MISS_MEMORY_MIN  = 0.10;
+
+// ─── Core pools ──────────────────────────────────────────────────────────────
+static const std::vector<int> POOL_HIGH   = {0, 1};
+static const std::vector<int> POOL_NORMAL = {2, 3};
+
+// ─── Signal handling ──────────────────────────────────────────────────────────
+static volatile bool g_running = true;
+static void on_signal(int) { g_running = false; }
+
+// ─── Timestamp helper ─────────────────────────────────────────────────────────
+static void ts()
+{
+    time_t now = time(nullptr);
+    struct tm *t = localtime(&now);
+    printf("[%02d:%02d:%02d] ", t->tm_hour, t->tm_min, t->tm_sec);
+}
+
+// ─── Per-task tracking record ─────────────────────────────────────────────────
+struct TaskRecord {
+    pid_t       pid;
+    std::string name;           // from /proc/<pid>/comm
+    std::string type;           // COMPUTE / MEMORY / MIXED / UNKNOWN
+    bool        high_prio;
+    int         assigned_core;
+    int         reprof_count;   // how many times re-profiled
+    int         stable_count;   // consecutive same-classification rounds
+    time_t      last_profiled;
+};
+
+// Global tracking table: pid → record
+static std::map<pid_t, TaskRecord> g_tasks;
+
+// PIDs we should ignore (system processes, the daemon itself)
+static std::set<pid_t> g_ignore;
+
+// ─── /proc helpers ───────────────────────────────────────────────────────────
+static std::string read_comm(pid_t pid)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return "";
+    char buf[64] = {};
+    if (fgets(buf, sizeof(buf), f)) {
+        size_t len = strlen(buf);
+        if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+    }
+    fclose(f);
+    return std::string(buf);
+}
+
+static bool pid_exists(pid_t pid)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    return access(path, F_OK) == 0;
+}
+
+// Scan /proc for all numeric directories = all running PIDs
+static std::set<pid_t> scan_proc()
+{
+    std::set<pid_t> pids;
+    DIR *d = opendir("/proc");
+    if (!d) return pids;
+    struct dirent *e;
+    while ((e = readdir(d)) != nullptr) {
+        if (e->d_type != DT_DIR && e->d_type != DT_UNKNOWN) continue;
+        char *end;
+        long val = strtol(e->d_name, &end, 10);
+        if (*end == '\0' && val > 1)
+            pids.insert((pid_t)val);
+    }
+    closedir(d);
+    return pids;
+}
+
+// ─── CPU load from /proc/stat ─────────────────────────────────────────────────
+struct CpuTick { long long idle = 0, total = 0; };
+
+static std::map<int, CpuTick> read_ticks()
+{
+    std::map<int, CpuTick> out;
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f) return out;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "cpu", 3) != 0) break;
+        if (line[3] == ' ') continue;
+        int core = -1;
+        long long u, n, s, id, iw, irq, si;
+        if (sscanf(line, "cpu%d %lld %lld %lld %lld %lld %lld %lld",
+                   &core, &u, &n, &s, &id, &iw, &irq, &si) == 8) {
+            out[core] = {id + iw, u + n + s + id + iw + irq + si};
+        }
+    }
+    fclose(f);
+    return out;
+}
+
+static std::map<int, double> core_load(int ms = 300)
+{
+    auto s1 = read_ticks();
+    usleep(ms * 1000);
+    auto s2 = read_ticks();
+    std::map<int, double> load;
+    for (auto &[c, t2] : s2) {
+        if (!s1.count(c)) continue;
+        auto &t1 = s1[c];
+        long long dt = t2.total - t1.total;
+        long long di = t2.idle  - t1.idle;
+        load[c] = dt > 0 ? 100.0 * (1.0 - (double)di / dt) : 0.0;
+    }
+    return load;
+}
+
+// ─── Load-aware core selector ─────────────────────────────────────────────────
+static int select_core(const std::vector<int> &pool, int pref_idx,
+                        const std::map<int, double> &load)
+{
+    int    pref = pool[pref_idx % (int)pool.size()];
+    double pl   = load.count(pref) ? load.at(pref) : 0.0;
+    int    best = pref;
+    double bl   = pl;
+    for (int c : pool) {
+        double l = load.count(c) ? load.at(c) : 0.0;
+        if (l < bl) { bl = l; best = c; }
+    }
+    if (best != pref && (pl - bl) >= LOAD_BIAS) return best;
+    return pref;
+}
+
+// ─── CPU affinity ────────────────────────────────────────────────────────────
+static int cpu_count()
+{
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
+}
+
+static void pin_to_core(pid_t pid, int core)
+{
+    if (core < 0 || core >= cpu_count()) return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    sched_setaffinity(pid, sizeof(set), &set);
+}
+
+// ─── perf counter helpers ─────────────────────────────────────────────────────
+static long perf_event_open(struct perf_event_attr *a, pid_t pid,
+                             int cpu, int gfd, unsigned long flags)
+{
+    return syscall(__NR_perf_event_open, a, pid, cpu, gfd, flags);
+}
+
+static perf_event_attr make_attr(__u32 config)
+{
+    perf_event_attr pe{};
+    pe.type = PERF_TYPE_HARDWARE; pe.size = sizeof(pe);
+    pe.config = config; pe.disabled = 1;
+    pe.inherit = 1; pe.exclude_hv = 1;
+    return pe;
+}
+
+struct PerfFd {
+    int fd;
+    explicit PerfFd(int f) : fd(f) {}
+    ~PerfFd() { if (fd != -1) close(fd); }
+    bool ok() const { return fd != -1; }
+};
+
+static long long read_ctr(int fd)
+{
+    long long v = 0;
+    if (read(fd, &v, sizeof(v)) != (ssize_t)sizeof(v)) return 0;
+    return v;
+}
+
+// ─── Core profiling + classification ─────────────────────────────────────────
+struct Profile { double ipc; double miss_rate; std::string type; bool high_prio; };
+
+static Profile profile_pid(pid_t pid)
+{
+    Profile p{0, 0, "UNKNOWN", false};
+
+    auto ai = make_attr(PERF_COUNT_HW_INSTRUCTIONS);
+    auto ac = make_attr(PERF_COUNT_HW_CPU_CYCLES);
+    auto am = make_attr(PERF_COUNT_HW_CACHE_MISSES);
+
+    PerfFd fi(perf_event_open(&ai, pid, -1, -1, 0));
+    PerfFd fc(perf_event_open(&ac, pid, -1, -1, 0));
+    PerfFd fm(perf_event_open(&am, pid, -1, -1, 0));
+
+    if (!fi.ok() || !fc.ok() || !fm.ok()) return p;
+
+    ioctl(fi.fd, PERF_EVENT_IOC_RESET,  0); ioctl(fc.fd, PERF_EVENT_IOC_RESET,  0);
+    ioctl(fm.fd, PERF_EVENT_IOC_RESET,  0);
+    ioctl(fi.fd, PERF_EVENT_IOC_ENABLE, 0); ioctl(fc.fd, PERF_EVENT_IOC_ENABLE, 0);
+    ioctl(fm.fd, PERF_EVENT_IOC_ENABLE, 0);
+
+    sleep(SAMPLE_SECS);
+
+    ioctl(fi.fd, PERF_EVENT_IOC_DISABLE, 0); ioctl(fc.fd, PERF_EVENT_IOC_DISABLE, 0);
+    ioctl(fm.fd, PERF_EVENT_IOC_DISABLE, 0);
+
+    long long instr  = read_ctr(fi.fd);
+    long long cycles = read_ctr(fc.fd);
+    long long misses = read_ctr(fm.fd);
+
+    if (instr <= 0 || cycles <= 0) return p;
+
+    p.ipc       = (double)instr  / (double)cycles;
+    p.miss_rate = (double)misses / (double)instr;
+
+    if (p.ipc >= IPC_COMPUTE_MIN && p.miss_rate <= MISS_COMPUTE_MAX)
+        p.type = "COMPUTE";
+    else if (p.ipc <= IPC_MEMORY_MAX || p.miss_rate >= MISS_MEMORY_MIN)
+        p.type = "MEMORY";
+    else
+        p.type = "MIXED";
+
+    errno = 0;
+    int nv = getpriority(PRIO_PROCESS, pid);
+    p.high_prio = (errno == 0 && nv < 0);
+
+    return p;
+}
+
+// ─── Place a task — returns assigned core ─────────────────────────────────────
+static int place(pid_t pid, const Profile &pr,
+                 const std::map<int, double> &load)
+{
+    const auto &pool = pr.high_prio ? POOL_HIGH : POOL_NORMAL;
+    int pref_idx = (pr.type == "MEMORY") ? 1 : 0;
+    int core = select_core(pool, pref_idx, load);
+    pin_to_core(pid, core);
+    return core;
+}
+
+// ─── Handle a newly discovered PID ───────────────────────────────────────────
+static void on_new_pid(pid_t pid)
+{
+    std::string name = read_comm(pid);
+    if (name.empty()) return; // already gone
+
+    ts(); printf("NEW  PID %-6d (%s) — profiling...\n", pid, name.c_str());
+
+    Profile pr = profile_pid(pid);
+    if (pr.type == "UNKNOWN") {
+        ts(); printf("     PID %-6d — perf failed, skipping\n", pid);
+        g_ignore.insert(pid);
+        return;
+    }
+
+    auto load = core_load(300);
+    int core  = place(pid, pr, load);
+
+    ts(); printf("     PID %-6d (%s) | %s | %s | IPC=%.3f MissRate=%.4f → Core %d\n",
+           pid, name.c_str(),
+           pr.high_prio ? "HIGH" : "NORMAL",
+           pr.type.c_str(), pr.ipc, pr.miss_rate, core);
+
+    g_tasks[pid] = {pid, name, pr.type, pr.high_prio,
+                    core, 0, 1, time(nullptr)};
+}
+
+// ─── Re-profile a known task, migrate if classification changed ───────────────
+static void reprof(TaskRecord &rec)
+{
+    if (!pid_exists(rec.pid)) {
+        ts(); printf("GONE PID %-6d (%s)\n", rec.pid, rec.name.c_str());
+        g_tasks.erase(rec.pid);
+        return;
+    }
+
+    Profile pr = profile_pid(rec.pid);
+    rec.reprof_count++;
+    rec.last_profiled = time(nullptr);
+
+    if (pr.type == "UNKNOWN") return;
+
+    bool type_changed = (pr.type != rec.type);
+    bool prio_changed = (pr.high_prio != rec.high_prio);
+
+    if (type_changed || prio_changed) {
+        rec.stable_count = 0; // reset stability counter
+
+        // Only migrate after MIGRATE_COOLDOWN unstable rounds
+        // This prevents thrashing on boundary tasks
+        if (rec.reprof_count % MIGRATE_COOLDOWN == 0) {
+            auto load = core_load(300);
+            int new_core = place(rec.pid, pr, load);
+
+            ts(); printf("MIGR PID %-6d (%s) | %s→%s | Core %d→%d\n",
+                   rec.pid, rec.name.c_str(),
+                   rec.type.c_str(), pr.type.c_str(),
+                   rec.assigned_core, new_core);
+
+            rec.type          = pr.type;
+            rec.high_prio     = pr.high_prio;
+            rec.assigned_core = new_core;
+        } else {
+            ts(); printf("UNSTABLE PID %-6d (%s) | %s→%s (cooldown %d/%d)\n",
+                   rec.pid, rec.name.c_str(),
+                   rec.type.c_str(), pr.type.c_str(),
+                   rec.reprof_count % MIGRATE_COOLDOWN, MIGRATE_COOLDOWN);
+        }
+    } else {
+        rec.stable_count++;
+        rec.type      = pr.type;
+        rec.high_prio = pr.high_prio;
+
+        ts(); printf("OK   PID %-6d (%s) | %s | Core %d | IPC=%.3f Miss=%.4f (stable x%d)\n",
+               rec.pid, rec.name.c_str(), rec.type.c_str(),
+               rec.assigned_core, pr.ipc, pr.miss_rate, rec.stable_count);
+    }
+}
+
+// ─── Print current state table ────────────────────────────────────────────────
+static void print_table()
+{
+    if (g_tasks.empty()) return;
+    printf("\n%s\n", std::string(80, '-').c_str());
+    printf("  %-6s %-16s %-6s %-8s %-5s %-6s\n",
+           "PID", "NAME", "PRIO", "TYPE", "CORE", "STABLE");
+    printf("%s\n", std::string(80, '-').c_str());
+    for (auto &[pid, r] : g_tasks) {
+        printf("  %-6d %-16s %-6s %-8s %-5d x%d\n",
+               r.pid, r.name.c_str(),
+               r.high_prio ? "HIGH" : "NORMAL",
+               r.type.c_str(), r.assigned_core, r.stable_count);
+    }
+    printf("%s\n\n", std::string(80, '-').c_str());
+}
+
+// ─── main ────────────────────────────────────────────────────────────────────
+int main(int argc, char *argv[])
+{
+    signal(SIGINT,  on_signal);
+    signal(SIGTERM, on_signal);
+
+    printf("╔══════════════════════════════════════════════╗\n");
+    printf("║   ECU Task Placement Daemon                  ║\n");
+    printf("║   Adaptive · Load-Aware · Continuous         ║\n");
+    printf("╚══════════════════════════════════════════════╝\n");
+    printf("CPUs online     : %d\n", cpu_count());
+    printf("Scan interval   : %ds\n", SCAN_INTERVAL);
+    printf("Re-profile every: %ds\n", REPROF_INTERVAL);
+    printf("Sample window   : %ds\n", SAMPLE_SECS);
+    printf("Load bias       : %.0f%%\n", LOAD_BIAS);
+    printf("Core pools      : HIGH={0,1}  NORMAL={2,3}\n");
+    printf("Press Ctrl+C to stop.\n\n");
+
+    // Populate ignore list with existing PIDs if watching all
+    bool watch_all = (argc == 1);
+    if (watch_all) {
+        // Ignore everything already running at daemon start
+        // so we only profile processes that appear AFTER we start
+        g_ignore = scan_proc();
+        g_ignore.insert(getpid());
+        ts(); printf("Watching for NEW processes (ignoring %zu existing PIDs).\n\n",
+               g_ignore.size());
+    } else {
+        // Watch only specified PIDs
+        for (int i = 1; i < argc; i++) {
+            pid_t pid = (pid_t)atoi(argv[i]);
+            if (pid > 0 && pid_exists(pid))
+                on_new_pid(pid);
+        }
+    }
+
+    time_t last_reprof = time(nullptr);
+    int    cycle       = 0;
+
+    while (g_running) {
+        cycle++;
+
+        // ── Scan for new PIDs ──────────────────────────────────────────────
+        if (watch_all) {
+            auto current = scan_proc();
+            for (pid_t pid : current) {
+                if (g_ignore.count(pid))  continue;
+                if (g_tasks.count(pid))   continue;
+                on_new_pid(pid);
+                g_ignore.insert(pid); // don't re-process same PID
+            }
+        }
+
+        // ── Re-profile known tasks periodically ───────────────────────────
+        time_t now = time(nullptr);
+        if (now - last_reprof >= REPROF_INTERVAL && !g_tasks.empty()) {
+            ts(); printf("── Re-profiling %zu tracked tasks ──\n", g_tasks.size());
+
+            // Collect pids to reprof (can't iterate+erase safely)
+            std::vector<pid_t> to_reprof;
+            for (auto &[pid, _] : g_tasks) to_reprof.push_back(pid);
+
+            for (pid_t pid : to_reprof) {
+                if (g_tasks.count(pid))
+                    reprof(g_tasks[pid]);
+            }
+
+            print_table();
+            last_reprof = now;
+        }
+
+        sleep(SCAN_INTERVAL);
+    }
+
+    ts(); printf("Daemon shutting down. Tracked %zu tasks total.\n",
+           g_tasks.size() + g_ignore.size());
+    return 0;
+}

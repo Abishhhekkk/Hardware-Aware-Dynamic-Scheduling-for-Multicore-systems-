@@ -1,0 +1,193 @@
+/*
+ * ecu3.cpp — Testbench for ECU Placement Daemon
+ *
+ * Spawns 6 tasks designed to demonstrate every daemon capability:
+ *
+ *   HI-COMPUTE   → pure integer loop, nice=-10  → daemon places Core 0
+ *   HI-MEMORY    → pointer chase,    nice=-10  → daemon places Core 1
+ *   NORM-COMPUTE → pure integer loop, nice=0   → daemon places Core 2
+ *   NORM-MEMORY  → pointer chase,    nice=0   → daemon places Core 3
+ *   SHIFTER      → compute 30s → switches to memory  → daemon detects MIGR
+ *   SHORT-LIVED  → compute 20s then exits             → daemon logs GONE
+ *
+ * This file does ZERO placement. The daemon does everything.
+ * Just spawn and wait.
+ */
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <cstring>
+#include <vector>
+#include <string>
+
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
+
+// ─── Workload functions ───────────────────────────────────────────────────────
+
+// High IPC, zero cache pressure — always COMPUTE
+static void compute_worker()
+{
+    uint64_t a = 0x123456789ABCDEF0ULL, b = 0xFEDCBA9876543210ULL;
+    uint64_t c = 0xDEADBEEFCAFEBABEULL, d = 0x0102030405060708ULL;
+    while (true) {
+        for (int i = 0; i < 100000; i++) {
+            a = a * 6364136223846793005ULL + 1442695040888963407ULL;
+            b = (b ^ (b >> 17)) * 0xBF58476D1CE4E5B9ULL;
+            c = (c + (c << 13)) ^ (c >> 7);
+            d = d * 2862933555777941757ULL + 3037000493ULL;
+        }
+        *(volatile uint64_t *)&a = a ^ b ^ c ^ d;
+    }
+}
+
+// Low IPC, high LLC miss rate — always MEMORY
+static void memory_worker()
+{
+    const size_t SZ     = 256UL * 1024 * 1024;
+    const size_t ELEMS  = SZ / sizeof(uint64_t);
+    const size_t STRIDE = 4096 / sizeof(uint64_t);
+    uint64_t *buf = (uint64_t *)malloc(SZ);
+    if (!buf) _exit(1);
+    for (size_t i = 0; i < ELEMS; i++) buf[i] = (i + STRIDE) % ELEMS;
+    size_t idx = 0;
+    while (true) {
+        for (size_t n = 0; n < 1000000; n++) idx = buf[idx];
+        *(volatile size_t *)&idx = idx;
+    }
+}
+
+// Starts as COMPUTE, then switches to MEMORY after SHIFT_AFTER seconds
+// Daemon should detect the change and migrate the task to a different core
+static void shifter_worker()
+{
+    const int SHIFT_AFTER = 30; // seconds before behavior change
+
+    // === Phase 1: COMPUTE (30 seconds) ===
+    {
+        uint64_t a = 0x123456789ABCDEF0ULL, b = 0xFEDCBA9876543210ULL;
+        uint64_t c = 0xDEADBEEFCAFEBABEULL, d = 0x0102030405060708ULL;
+        time_t start = time(nullptr);
+        while (time(nullptr) - start < SHIFT_AFTER) {
+            for (int i = 0; i < 100000; i++) {
+                a = a * 6364136223846793005ULL + 1442695040888963407ULL;
+                b = (b ^ (b >> 17)) * 0xBF58476D1CE4E5B9ULL;
+                c = (c + (c << 13)) ^ (c >> 7);
+                d = d * 2862933555777941757ULL + 3037000493ULL;
+            }
+            *(volatile uint64_t *)&a = a ^ b ^ c ^ d;
+        }
+    }
+
+    // === Phase 2: MEMORY (runs forever after shift) ===
+    {
+        const size_t SZ     = 256UL * 1024 * 1024;
+        const size_t ELEMS  = SZ / sizeof(uint64_t);
+        const size_t STRIDE = 4096 / sizeof(uint64_t);
+        uint64_t *buf = (uint64_t *)malloc(SZ);
+        if (!buf) _exit(1);
+        for (size_t i = 0; i < ELEMS; i++) buf[i] = (i + STRIDE) % ELEMS;
+        size_t idx = 0;
+        while (true) {
+            for (size_t n = 0; n < 1000000; n++) idx = buf[idx];
+            *(volatile size_t *)&idx = idx;
+        }
+    }
+}
+
+// Runs compute for 20 seconds then exits cleanly
+// Daemon should log GONE when it disappears
+static void short_lived_worker()
+{
+    uint64_t a = 0xCAFEBABEDEADBEEFULL, b = 0x0BADCAFE12345678ULL;
+    time_t start = time(nullptr);
+    while (time(nullptr) - start < 20) {
+        for (int i = 0; i < 100000; i++) {
+            a = a * 6364136223846793005ULL + 1;
+            b = (b ^ (b >> 17)) * 0xBF58476D1CE4E5B9ULL;
+        }
+        *(volatile uint64_t *)&a = a ^ b;
+    }
+    // exits naturally — daemon logs GONE
+}
+
+// ─── Spawn helper ─────────────────────────────────────────────────────────────
+using WorkerFn = void(*)();
+
+static pid_t spawn(WorkerFn fn, int nice_val, const char *label)
+{
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return -1; }
+    if (pid == 0) {
+        if (setpriority(PRIO_PROCESS, 0, nice_val) != 0)
+            fprintf(stderr, "[WARN] setpriority(%d) for %s: %s\n",
+                    nice_val, label, strerror(errno));
+
+        // Silence child output — daemon reads from /proc, not stdout
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull != -1) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        fn();
+        _exit(0);
+    }
+    return pid;
+}
+
+// ─── main ────────────────────────────────────────────────────────────────────
+int main()
+{
+    printf("╔══════════════════════════════════════════════╗\n");
+    printf("║   ECU Testbench — Daemon Integration Test    ║\n");
+    printf("╚══════════════════════════════════════════════╝\n\n");
+    printf("This testbench does ZERO placement.\n");
+    printf("The daemon discovers and places all tasks automatically.\n\n");
+
+    struct TB { const char *name; WorkerFn fn; int nice; const char *expect; };
+    TB benches[] = {
+        { "HI-COMPUTE",  compute_worker,   -10, "Core 0 (HIGH COMPUTE)"  },
+        { "HI-MEMORY",   memory_worker,    -10, "Core 1 (HIGH MEMORY)"   },
+        { "NORM-COMPUTE",compute_worker,     0, "Core 2 (NORM COMPUTE)"  },
+        { "NORM-MEMORY", memory_worker,      0, "Core 3 (NORM MEMORY)"   },
+        { "SHIFTER",     shifter_worker,     0, "Core 2 → Core 3 (MIGR)" },
+        { "SHORT-LIVED", short_lived_worker, 0, "Core 2 → GONE in ~20s"  },
+    };
+
+    printf("%-14s  %-6s  %-8s  %s\n", "TASK", "NICE", "PID", "EXPECTED (daemon will place)");
+    printf("%s\n", std::string(65, '-').c_str());
+
+    std::vector<pid_t> pids;
+    for (auto &b : benches) {
+        pid_t p = spawn(b.fn, b.nice, b.name);
+        if (p > 0) {
+            pids.push_back(p);
+            printf("%-14s  %+6d  %-8d  %s\n", b.name, b.nice, p, b.expect);
+        }
+    }
+
+    printf("\n[INFO] All tasks spawned. Daemon will pick them up within %d seconds.\n", 5);
+    printf("[INFO] SHIFTER switches from COMPUTE→MEMORY after 30 seconds.\n");
+    printf("[INFO] SHORT-LIVED exits after 20 seconds.\n");
+    printf("[INFO] Press Ctrl+C to stop testbench (daemon keeps running).\n\n");
+
+    // Wait for all children — reap as they finish
+    int remaining = (int)pids.size();
+    while (remaining > 0) {
+        int status;
+        pid_t done = waitpid(-1, &status, 0);
+        if (done > 0) {
+            remaining--;
+            // SHORT-LIVED exits naturally, others need Ctrl+C
+        }
+    }
+
+    printf("\n[INFO] All testbench tasks finished.\n");
+    return 0;
+}
