@@ -1,0 +1,194 @@
+Hardware-Aware Dynamic Scheduling for Multicore Systems
+
+A userspace Linux scheduling framework that uses runtime hardware performance counters to classify workloads and dynamically optimize multicore CPU placement.
+
+🎯 Overview
+
+Traditional Linux scheduling primarily focuses on fairness and CPU utilization without directly considering the hardware behavior of individual workloads.
+
+This project implements a hardware-aware adaptive scheduling framework that continuously profiles running processes using Linux hardware performance counters and dynamically adjusts CPU placement based on workload behavior.
+
+The framework operates entirely in userspace, without modifying the Linux kernel scheduler.
+
+⚙️ How It Works
+              Running Processes
+                     │
+                     ▼
+          ┌─────────────────────┐
+          │ Process Discovery   │
+          │      /proc          │
+          └──────────┬──────────┘
+                     │
+                     ▼
+          ┌─────────────────────┐
+          │ Hardware Profiling  │
+          │  perf_event_open()  │
+          └──────────┬──────────┘
+                     │
+             ┌───────┴────────┐
+             ▼                ▼
+          IPC Rate       Cache Miss Rate
+             │                │
+             └───────┬────────┘
+                     ▼
+          ┌─────────────────────┐
+          │ Workload            │
+          │ Classification      │
+          └──────────┬──────────┘
+                     │
+        ┌────────────┼────────────┐
+        ▼            ▼            ▼
+     COMPUTE      MEMORY        MIXED
+        │            │            │
+        └────────────┼────────────┘
+                     ▼
+          ┌─────────────────────┐
+          │ CPU Affinity &      │
+          │ Core Placement      │
+          └──────────┬──────────┘
+                     │
+                     ▼
+          ┌─────────────────────┐
+          │ Adaptive Migration  │
+          │ + Load Balancing    │
+          └─────────────────────┘
+🔬 Key Features
+Runtime workload classification
+Hardware performance counter monitoring
+IPC-based workload characterization
+Cache-miss-rate analysis
+Compute / memory / mixed workload detection
+Adaptive CPU affinity management
+Dynamic task migration
+Load-aware multicore balancing
+Priority-aware workload placement
+Migration hysteresis for scheduling stability
+Continuous runtime reprofiling
+Userspace implementation with no kernel modifications
+🧠 Hardware-Aware Workload Classification
+
+The scheduler uses two primary runtime metrics:
+
+Instructions Per Cycle
+IPC = Instructions Executed / CPU Cycles
+
+Higher IPC generally indicates compute-intensive execution.
+
+Cache Miss Rate
+Miss Rate = Cache Misses / Instructions
+
+Higher cache miss rates indicate increased memory-access pressure.
+
+The scheduler uses these measurements to classify workloads as:
+
+COMPUTE
+MEMORY
+MIXED
+
+The classification is continuously updated as workload behavior changes.
+
+🖥️ Target Platform
+Component	Configuration
+Platform	Raspberry Pi 3 Model B
+CPU	Quad-core ARM Cortex-A53
+CPU Frequency	1.2 GHz
+OS	Ubuntu Linux
+Scheduler	Userspace daemon
+Profiling	Linux perf_event_open()
+CPU Control	sched_setaffinity()
+
+The implementation was evaluated using synthetic compute-intensive, memory-intensive, mixed, and dynamically shifting workloads.
+
+📊 Results
+System Performance
+Metric	Linux CFS	Proposed Scheduler
+System IPC	0.59	0.90
+Compute IPC	0.70–1.00	0.896–1.045
+Memory Miss Rate	13.69%	7.81–7.85%
+The measured system IPC increased from 0.59 to 0.90, corresponding to approximately 52% throughput improvement under the evaluated mixed-workload conditions.
+🔄 Adaptive Runtime Migration
+
+The scheduler continuously reprofiles workloads.
+
+When a workload transitions between execution characteristics:
+
+COMPUTE
+   │
+   │ workload phase changes
+   ▼
+MEMORY
+   │
+   ▼
+Reclassification
+   │
+   ▼
+CPU affinity update
+   │
+   ▼
+Task migration
+Migration hysteresis prevents unnecessary oscillation caused by short-lived workload fluctuations.
+📈 Core Placement
+
+The scheduler separates workloads according to runtime behavior and priority:
+
+Workload	Priority	Assigned Core
+Compute-intensive	High	Core 0
+Memory-intensive	High	Core 1
+Compute-intensive	Normal	Core 2
+Memory-intensive	Normal	Core 3
+Mixed / Dynamic	Adaptive	Runtime Migration
+
+This reduces competing workloads sharing the same hardware resources and enables adaptive placement when workload behavior changes.
+
+🛠️ Technologies
+
+Languages
+
+C++
+C
+
+Operating Systems
+
+Linux
+Ubuntu
+
+Systems
+
+Multicore scheduling
+CPU affinity
+Linux /proc
+Userspace daemons
+Hardware performance counters
+
+Hardware
+
+Raspberry Pi 3
+ARM Cortex-A53
+
+Linux APIs
+
+perf_event_open()
+sched_setaffinity()
+
+🚀 Future Work
+
+Potential extensions include:
+
+Heterogeneous CPU scheduling
+GPU / NPU / FPGA-aware scheduling
+Energy-aware scheduling
+ML-assisted workload prediction
+Accelerator-aware workload offloading
+Kernel-assisted scheduling mechanisms
+
+These directions build toward scheduling across heterogeneous embedded and edge-computing platforms.
+
+👨‍💻 Author
+
+Abishek Thirunavukkarasu
+MS Electrical & Computer Engineering
+University of Massachusetts Amherst
+
+Portfolio • LinkedIn
+
+⭐ If you find this project interesting, consider giving the repository a star.
